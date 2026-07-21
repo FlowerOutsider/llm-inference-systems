@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+.venv*/
+venv/
+.env
+
+# CUDA and C++
+*.o
+*.ptx
+*.cubin
+*.fatbin
+*.so
+build/
+cmake-build-*/
+compile_commands.json
+
+# Large local artifacts
+data/
+datasets/
+models/
+checkpoints/
+outputs/
+wandb/
+
+# Logs and temporary files
+*.log
+tmp/
+.cache/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
