@@ -35,3 +35,9 @@ tmp/
 .vscode/
 .idea/
 .DS_Store
+
+# GPU profiling artifacts
+benchmarks/kernels/results/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
