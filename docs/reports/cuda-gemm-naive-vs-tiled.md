@@ -42,3 +42,21 @@
 Tiled GEMM 将 A、B 的局部数据块加载到 shared memory，使同一 block 内的多个线程复用数据，降低了重复的全局内存访问与等待。性能提升 1.318x，吞吐从 751.802 GFLOPS 提升到 990.648 GFLOPS。
 
 该实现仍未使用 register tiling、向量化加载、Tensor Core、warp-level primitive 或 cuBLAS，因此它是后续高性能 GEMM 优化的正确基线，而不是最终实现。
+
+## Tile Size Sweep
+
+| Tile Size | Tiled Latency | Tiled Throughput | NCU Duration | Achieved Occupancy |
+| --- | ---: | ---: | ---: | ---: |
+| 8 x 8 | 2.728 ms | 787.161 GFLOPS | 3.51 ms | 66.07% |
+| 16 x 16 | 2.168 ms | 990.554 GFLOPS | 2.74 ms | 98.33% |
+| 32 x 32 | 2.256 ms | 951.866 GFLOPS | 3.08 ms | 66.63% |
+
+### Tile Size Analysis
+
+16 x 16 是本实验中的最优配置。
+
+8 x 8 的 tile 较小，shared memory 数据复用不足；同时每个 block 仅有 64 个线程，受 resident block 数量限制，实际 occupancy 仅为 66.07%。
+
+32 x 32 的 tile 提高了数据复用，但每个 block 包含 1024 个线程。单个 SM 同时只能驻留一个此类 block，occupancy 降至 66.63%，降低了隐藏访存延迟的能力。
+
+16 x 16 在 shared memory 复用、同步开销和并发度之间取得最佳平衡，achieved occupancy 达到 98.33%，吞吐达到 990.554 GFLOPS。

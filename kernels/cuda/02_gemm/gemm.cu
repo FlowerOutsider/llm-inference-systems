@@ -11,7 +11,16 @@
 #include <vector>
 
 constexpr int kMatrixSize = 1024;
-constexpr int kTileSize = 16;
+
+
+
+#ifndef GEMM_TILE_SIZE
+#define GEMM_TILE_SIZE 16
+#endif
+
+constexpr int kTileSize = GEMM_TILE_SIZE;
+
+
 constexpr int kWarmupIterations = 5;
 constexpr int kBenchmarkIterations = 20;
 
@@ -241,6 +250,8 @@ int main() {
     std::cout << std::fixed << std::setprecision(3)
               << "Matrix size: " << kMatrixSize << " x "
               << kMatrixSize << "\n"
+              << "Tile size: " << kTileSize << " x "
+              << kTileSize << "\n"
               << "Launch config: " << grid.x << " x " << grid.y
               << " blocks, " << block.x << " x " << block.y
               << " threads\n"
