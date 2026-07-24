@@ -41,3 +41,7 @@ benchmarks/kernels/results/
 *.nsys-rep
 *.sqlite
 *.ncu-rep
+
+# CMake generated build directories
+build/
+build-*/
