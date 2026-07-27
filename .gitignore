@@ -45,3 +45,6 @@ benchmarks/kernels/results/
 # CMake generated build directories
 build/
 build-*/
+
+# PyTorch profiler traces
+benchmarks/serving/results/
