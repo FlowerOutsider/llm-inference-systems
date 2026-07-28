@@ -9,6 +9,13 @@ import torch
 from serving.data_plane.kv_cache import KVCacheCapacityError, KVCacheError
 
 
+@dataclass(frozen=True)
+class COWReplacement:
+    slot_id: int
+    logical_block_index: int
+    original_block_id: int
+    replacement_block_id: int
+
 @dataclass
 class AppendReservation:
     """A pending multi-layer append transaction."""
@@ -18,6 +25,7 @@ class AppendReservation:
     start_positions: tuple[int, ...]
     token_count: int
     new_blocks_by_slot: dict[int, tuple[int, ...]]
+    cow_replacements: tuple[COWReplacement, ...] = ()
     written_layers: set[int] = field(default_factory=set)
 
 
@@ -93,7 +101,7 @@ class PagedKVCache:
         self._active_slots: set[int] = set()
         self._slot_blocks: list[list[int]] = [[] for _ in range(max_slots)]
         self._free_blocks: deque[int] = deque(range(num_gpu_blocks))
-
+        self._block_refcounts = [0] * num_gpu_blocks
         self._next_reservation_id = 0
         self._reservations: dict[int, AppendReservation] = {}
         self._pending_slots: set[int] = set()
@@ -172,7 +180,11 @@ class PagedKVCache:
             )
 
         for slot_id in normalized_slot_ids:
-            self._free_blocks.extend(self._slot_blocks[slot_id])
+            block_ids = self._slot_blocks[slot_id]
+
+            for physical_block_id in block_ids:
+                self._release_block_reference(physical_block_id)
+
             self._slot_blocks[slot_id] = []
             self._lengths[slot_id] = 0
             self._block_table[slot_id].fill_(-1)
@@ -186,6 +198,9 @@ class PagedKVCache:
     ) -> AppendReservation:
         """
         Reserve logical positions and required blocks without advancing lengths.
+
+        If appending would overwrite a shared partial tail block, perform
+        copy-on-write before any layer writes become visible.
         """
         self._validate_positive("token_count", token_count)
         normalized_slot_ids = self._validate_slot_ids(slot_ids)
@@ -196,14 +211,13 @@ class PagedKVCache:
                 f"slots already have pending append reservations: {sorted(pending)}"
             )
 
-        required_new_blocks = self._required_new_blocks(
-            normalized_slot_ids,
-            token_count,
+        required_blocks = (
+            self._required_new_blocks(normalized_slot_ids, token_count)
+            + self._required_cow_blocks(normalized_slot_ids)
         )
-
-        if required_new_blocks > self.free_block_count:
+        if required_blocks > self.free_block_count:
             raise KVCacheCapacityError(
-                f"append requires {required_new_blocks} free blocks, "
+                f"append requires {required_blocks} free blocks, "
                 f"but only {self.free_block_count} remain"
             )
 
@@ -211,11 +225,33 @@ class PagedKVCache:
             self._lengths[slot_id] for slot_id in normalized_slot_ids
         )
         new_blocks_by_slot: dict[int, tuple[int, ...]] = {}
+        cow_replacements: list[COWReplacement] = []
 
-        for slot_id in normalized_slot_ids:
-            new_blocks_by_slot[slot_id] = tuple(
-                self._allocate_blocks_for_append(slot_id, token_count)
-            )
+        try:
+            for slot_id in normalized_slot_ids:
+                replacement = self._copy_on_write_tail_block_if_needed(slot_id)
+                if replacement is not None:
+                    cow_replacements.append(replacement)
+
+            for slot_id in normalized_slot_ids:
+                new_blocks_by_slot[slot_id] = tuple(
+                    self._allocate_blocks_for_append(slot_id, token_count)
+                )
+        except Exception:
+            for slot_id, new_blocks in new_blocks_by_slot.items():
+                for expected_block_id in reversed(new_blocks):
+                    actual_block_id = self._slot_blocks[slot_id].pop()
+                    if actual_block_id != expected_block_id:
+                        raise AssertionError("slot block metadata is inconsistent")
+
+                    logical_block_index = len(self._slot_blocks[slot_id])
+                    self._block_table[slot_id, logical_block_index] = -1
+                    self._release_block_reference(actual_block_id)
+
+            for replacement in reversed(cow_replacements):
+                self._restore_cow_replacement(replacement)
+
+            raise
 
         reservation = AppendReservation(
             reservation_id=self._next_reservation_id,
@@ -223,6 +259,7 @@ class PagedKVCache:
             start_positions=start_positions,
             token_count=token_count,
             new_blocks_by_slot=new_blocks_by_slot,
+            cow_replacements=tuple(cow_replacements),
         )
         self._next_reservation_id += 1
         self._reservations[reservation.reservation_id] = reservation
@@ -316,7 +353,10 @@ class PagedKVCache:
 
                 logical_block_index = len(self._slot_blocks[slot_id])
                 self._block_table[slot_id, logical_block_index] = -1
-                self._free_blocks.appendleft(actual_block_id)
+                self._release_block_reference(actual_block_id)
+
+        for replacement in reversed(reservation.cow_replacements):
+            self._restore_cow_replacement(replacement)
 
         self._close_reservation(reservation)
 
@@ -356,6 +396,56 @@ class PagedKVCache:
             if reservation.reservation_id in self._reservations:
                 self.abort_append(reservation)
             raise
+
+    def fork_prefix(
+        self,
+        *,
+        source_slot: int,
+        target_slot: int,
+        prefix_length: int,
+    ) -> None:
+        """
+        Share a prefix with target_slot.
+
+        A partial final block may be shared initially. If either sequence later
+        appends into that partial block, begin_append performs copy-on-write.
+        """
+        source_slot, target_slot = self._validate_slot_ids(
+            [source_slot, target_slot]
+        )
+
+        if source_slot in self._pending_slots or target_slot in self._pending_slots:
+            raise KVCacheError("cannot fork slots with pending append reservations")
+
+        if self._lengths[target_slot] != 0 or self._slot_blocks[target_slot]:
+            raise KVCacheError("target slot must be empty before prefix fork")
+
+        if prefix_length <= 0:
+            raise ValueError(
+                f"prefix_length must be positive, got {prefix_length}"
+            )
+
+        if prefix_length > self._lengths[source_slot]:
+            raise ValueError(
+                f"prefix_length {prefix_length} exceeds source length "
+                f"{self._lengths[source_slot]}"
+            )
+
+        prefix_block_count = (
+            prefix_length + self.block_size - 1
+        ) // self.block_size
+        shared_blocks = self._slot_blocks[source_slot][:prefix_block_count]
+
+        for logical_block_index, physical_block_id in enumerate(shared_blocks):
+            self._slot_blocks[target_slot].append(physical_block_id)
+            self._block_table[
+                target_slot,
+                logical_block_index,
+            ] = physical_block_id
+            self._block_refcounts[physical_block_id] += 1
+
+        self._lengths[target_slot] = prefix_length
+
 
     def get_kv(
         self,
@@ -404,6 +494,16 @@ class PagedKVCache:
         block_count = len(self._slot_blocks[slot_id])
         return self._block_table[slot_id, :block_count].clone()
 
+    def block_refcount(self, physical_block_id: int) -> int:
+        if not 0 <= physical_block_id < self.num_gpu_blocks:
+            raise IndexError(
+                "physical_block_id must be in "
+                f"[0, {self.num_gpu_blocks}), got {physical_block_id}"
+            )
+
+        return self._block_refcounts[physical_block_id]
+
+
     def length(self, slot_id: int) -> int:
         self._validate_slot_ids([slot_id])
         return self._lengths[slot_id]
@@ -427,6 +527,94 @@ class PagedKVCache:
             "physical_memory_mib": self.physical_memory_mib,
             "logical_memory_mib": self.logical_memory_bytes() / (1024 * 1024),
         }
+
+    def _required_cow_blocks(self, slot_ids: Sequence[int]) -> int:
+        required_cow_blocks = 0
+
+        for slot_id in slot_ids:
+            current_length = self._lengths[slot_id]
+
+            if current_length == 0:
+                continue
+
+            if current_length % self.block_size == 0:
+                continue
+
+            tail_block_index = (current_length - 1) // self.block_size
+            tail_block_id = self._slot_blocks[slot_id][tail_block_index]
+
+            if self._block_refcounts[tail_block_id] > 1:
+                required_cow_blocks += 1
+
+        return required_cow_blocks
+
+    def _acquire_free_block(self) -> int:
+        physical_block_id = self._free_blocks.popleft()
+
+        if self._block_refcounts[physical_block_id] != 0:
+            raise AssertionError("free block has a non-zero reference count")
+
+        self._block_refcounts[physical_block_id] = 1
+        return physical_block_id
+
+    def _copy_on_write_tail_block_if_needed(
+        self,
+        slot_id: int,
+    ) -> COWReplacement | None:
+        current_length = self._lengths[slot_id]
+
+        if current_length == 0 or current_length % self.block_size == 0:
+            return None
+
+        logical_block_index = (current_length - 1) // self.block_size
+        original_block_id = self._slot_blocks[slot_id][logical_block_index]
+
+        if self._block_refcounts[original_block_id] <= 1:
+            return None
+
+        replacement_block_id = self._acquire_free_block()
+
+        self._keys[:, replacement_block_id].copy_(
+            self._keys[:, original_block_id]
+        )
+        self._values[:, replacement_block_id].copy_(
+            self._values[:, original_block_id]
+        )
+
+        self._slot_blocks[slot_id][logical_block_index] = replacement_block_id
+        self._block_table[
+            slot_id,
+            logical_block_index,
+        ] = replacement_block_id
+
+        self._release_block_reference(original_block_id)
+
+        return COWReplacement(
+            slot_id=slot_id,
+            logical_block_index=logical_block_index,
+            original_block_id=original_block_id,
+            replacement_block_id=replacement_block_id,
+        )
+
+    def _restore_cow_replacement(self, replacement: COWReplacement) -> None:
+        actual_block_id = self._slot_blocks[
+            replacement.slot_id
+        ][replacement.logical_block_index]
+
+        if actual_block_id != replacement.replacement_block_id:
+            raise AssertionError("COW block-table metadata is inconsistent")
+
+        self._slot_blocks[replacement.slot_id][
+            replacement.logical_block_index
+        ] = replacement.original_block_id
+        self._block_table[
+            replacement.slot_id,
+            replacement.logical_block_index,
+        ] = replacement.original_block_id
+
+        self._block_refcounts[replacement.original_block_id] += 1
+        self._release_block_reference(replacement.replacement_block_id)
+
 
     def _required_new_blocks(
         self,
@@ -466,7 +654,9 @@ class PagedKVCache:
         new_blocks: list[int] = []
 
         while len(self._slot_blocks[slot_id]) < required_block_count:
-            physical_block_id = self._free_blocks.popleft()
+
+            physical_block_id = self._acquire_free_block()
+
             logical_block_index = len(self._slot_blocks[slot_id])
 
             self._slot_blocks[slot_id].append(physical_block_id)
@@ -474,6 +664,19 @@ class PagedKVCache:
             new_blocks.append(physical_block_id)
 
         return new_blocks
+
+    def _release_block_reference(self, physical_block_id: int) -> None:
+        if not 0 <= physical_block_id < self.num_gpu_blocks:
+            raise AssertionError("invalid physical block id")
+
+        if self._block_refcounts[physical_block_id] <= 0:
+            raise AssertionError("block reference count underflow")
+
+        self._block_refcounts[physical_block_id] -= 1
+
+        if self._block_refcounts[physical_block_id] == 0:
+            self._free_blocks.appendleft(physical_block_id)
+
 
     def _close_reservation(self, reservation: AppendReservation) -> None:
         del self._reservations[reservation.reservation_id]

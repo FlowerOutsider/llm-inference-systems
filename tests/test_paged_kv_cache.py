@@ -244,3 +244,178 @@ def test_incomplete_multilayer_append_cannot_commit_and_can_abort() -> None:
     assert cache.length(slot) == 0
     assert cache.allocated_block_count == 0
     assert cache.free_block_count == 2
+
+
+
+def test_fork_full_block_prefix_shares_physical_block() -> None:
+    cache = make_cache(block_size=4)
+    source_slot, target_slot = cache.allocate(2)
+
+    keys, values = make_kv(batch_size=1, token_count=6)
+    cache.append(
+        layer_idx=0,
+        slot_ids=[source_slot],
+        keys=keys,
+        values=values,
+    )
+
+    source_blocks = cache.block_table(source_slot).cpu().tolist()
+
+    cache.fork_prefix(
+        source_slot=source_slot,
+        target_slot=target_slot,
+        prefix_length=4,
+    )
+
+    target_blocks = cache.block_table(target_slot).cpu().tolist()
+
+    assert cache.length(source_slot) == 6
+    assert cache.length(target_slot) == 4
+    assert source_blocks[0] == target_blocks[0]
+    assert cache.block_refcount(source_blocks[0]) == 2
+
+    # 共享 block 不应额外分配物理显存。
+    assert cache.allocated_block_count == 2
+
+
+def test_shared_block_is_reclaimed_only_after_last_owner_releases() -> None:
+    cache = make_cache(block_size=4)
+    source_slot, target_slot = cache.allocate(2)
+
+    keys, values = make_kv(batch_size=1, token_count=6)
+    cache.append(
+        layer_idx=0,
+        slot_ids=[source_slot],
+        keys=keys,
+        values=values,
+    )
+
+    source_blocks = cache.block_table(source_slot).cpu().tolist()
+    shared_block = source_blocks[0]
+
+    cache.fork_prefix(
+        source_slot=source_slot,
+        target_slot=target_slot,
+        prefix_length=4,
+    )
+
+    cache.release([target_slot])
+
+    assert cache.block_refcount(shared_block) == 1
+    assert cache.allocated_block_count == 2
+
+    cache.release([source_slot])
+
+    assert cache.free_block_count == cache.num_gpu_blocks
+    assert cache.allocated_block_count == 0
+
+
+
+
+def test_append_after_partial_prefix_fork_uses_cow_and_preserves_source() -> None:
+    cache = make_cache(block_size=4, num_gpu_blocks=4)
+    source_slot, target_slot = cache.allocate(2)
+
+    source_keys, source_values = make_kv(
+        batch_size=1,
+        token_count=6,
+        value_offset=0,
+    )
+    cache.append(
+        layer_idx=0,
+        slot_ids=[source_slot],
+        keys=source_keys,
+        values=source_values,
+    )
+
+    source_blocks = cache.block_table(source_slot).cpu().tolist()
+
+    cache.fork_prefix(
+        source_slot=source_slot,
+        target_slot=target_slot,
+        prefix_length=6,
+    )
+
+    appended_keys, appended_values = make_kv(
+        batch_size=1,
+        token_count=1,
+        value_offset=1000,
+    )
+    cache.append(
+        layer_idx=0,
+        slot_ids=[target_slot],
+        keys=appended_keys,
+        values=appended_values,
+    )
+
+    target_blocks = cache.block_table(target_slot).cpu().tolist()
+
+    assert cache.length(source_slot) == 6
+    assert cache.length(target_slot) == 7
+
+    assert target_blocks[0] == source_blocks[0]
+    assert target_blocks[1] != source_blocks[1]
+    assert cache.block_refcount(source_blocks[1]) == 1
+    assert cache.block_refcount(target_blocks[1]) == 1
+
+    source_stored_keys, source_stored_values = cache.get_kv(
+        layer_idx=0,
+        slot_id=source_slot,
+    )
+    target_stored_keys, target_stored_values = cache.get_kv(
+        layer_idx=0,
+        slot_id=target_slot,
+    )
+
+    torch.testing.assert_close(source_stored_keys, source_keys[0])
+    torch.testing.assert_close(source_stored_values, source_values[0])
+
+    expected_target_keys = torch.cat(
+        [source_keys[0], appended_keys[0]],
+        dim=0,
+    )
+    expected_target_values = torch.cat(
+        [source_values[0], appended_values[0]],
+        dim=0,
+    )
+    torch.testing.assert_close(target_stored_keys, expected_target_keys)
+    torch.testing.assert_close(target_stored_values, expected_target_values)
+
+
+def test_abort_append_restores_shared_tail_block_after_cow() -> None:
+    cache = make_cache(block_size=4, num_gpu_blocks=4)
+    source_slot, target_slot = cache.allocate(2)
+
+    keys, values = make_kv(batch_size=1, token_count=6)
+    cache.append(
+        layer_idx=0,
+        slot_ids=[source_slot],
+        keys=keys,
+        values=values,
+    )
+
+    source_blocks = cache.block_table(source_slot).cpu().tolist()
+
+    cache.fork_prefix(
+        source_slot=source_slot,
+        target_slot=target_slot,
+        prefix_length=6,
+    )
+
+    reservation = cache.begin_append(
+        slot_ids=[target_slot],
+        token_count=1,
+    )
+
+    temporary_target_blocks = cache.block_table(target_slot).cpu().tolist()
+    assert temporary_target_blocks[1] != source_blocks[1]
+    assert cache.block_refcount(source_blocks[1]) == 1
+    assert cache.allocated_block_count == 3
+
+    cache.abort_append(reservation)
+
+    restored_target_blocks = cache.block_table(target_slot).cpu().tolist()
+    assert restored_target_blocks == source_blocks
+    assert cache.length(target_slot) == 6
+    assert cache.block_refcount(source_blocks[1]) == 2
+    assert cache.allocated_block_count == 2
