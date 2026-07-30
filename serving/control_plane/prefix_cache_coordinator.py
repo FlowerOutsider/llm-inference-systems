@@ -77,9 +77,10 @@ class PrefixCacheCoordinator:
     def release_slots(self, slot_ids: Sequence[int]) -> None:
         normalized_slot_ids = tuple(slot_ids)
 
-        # Remove discoverability first. Afterwards no request can receive a
-        # source_slot that is about to return its blocks to the free pool.
+        # 先删除索引，防止后续请求命中一个即将释放的 source slot。
         for slot_id in normalized_slot_ids:
             self._index.remove_slot(source_slot=slot_id)
 
+        # 再释放数据平面中的 slot。若 block 仍被其他请求共享，
+        # PagedKVCache 的引用计数会保证物理 block 不会提前回收。
         self._cache.release(normalized_slot_ids)
