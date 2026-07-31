@@ -1,0 +1,63 @@
+name: llm-inference-vllm
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.8.5}
+    gpus: all
+    ipc: host
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    ports:
+      - "${VLLM_HOST_PORT:-8002}:8000"
+
+    environment:
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-1}
+      TOKENIZERS_PARALLELISM: "false"
+
+    volumes:
+      - type: bind
+        source: ${HF_CACHE_DIR:-../../../.cache/huggingface}
+        target: /root/.cache/huggingface
+        read_only: false
+      - type: volume
+        source: vllm_compile_cache
+        target: /root/.cache/vllm
+
+    command:
+      - --model
+      - ${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
+      - --served-model-name
+      - ${SERVED_MODEL_NAME:-qwen2.5-0.5b}
+      - --dtype
+      - ${DTYPE:-half}
+      - --gpu-memory-utilization
+      - ${GPU_MEMORY_UTILIZATION:-0.70}
+      - --max-model-len
+      - ${MAX_MODEL_LEN:-2048}
+      - --max-num-seqs
+      - ${MAX_NUM_SEQS:-16}
+      - --max-num-batched-tokens
+      - ${MAX_NUM_BATCHED_TOKENS:-2048}
+      - --enable-prefix-caching
+      - --prefix-caching-hash-algo
+      - ${PREFIX_CACHE_HASH_ALGO:-sha256}
+      - --generation-config
+      - vllm
+      - --disable-log-requests
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+      
+volumes:
+  vllm_compile_cache:
+    name: llm-inference-vllm-compile-cache
