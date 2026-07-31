@@ -159,3 +159,52 @@ vLLM 的 Prefix Cache 指标按 KV block 统计，不按用户请求数统计。
 -   测试并发 12 和 16，观察接近 `max-num-seqs=16` 时的排队、延迟和错误行为。
 -   采集 vLLM `/metrics`，接入 Prometheus 与 Grafana，建立 TTFT、TPOT、队列长度、KV Cache 使用率和 Prefix Cache 命中率仪表板。
 -   在更大显存 GPU 上对比多模型、多实例和更高并发条件下的调度行为。
+
+
+## 9. Prefix Cache 开关对照实验
+
+### 9.1 对照条件
+
+两组实验使用相同模型、相同 GPU、相同请求脚本、相同共享前缀长度、相同单并发负载和相同生成上限。
+
+关闭组显式使用：
+
+```bash
+--no-enable-prefix-caching
+```
+
+这是必要条件。vLLM V1 引擎默认启用 Prefix Cache，仅省略 `--enable-prefix-caching` 不会关闭缓存。
+
+关闭组在压测后观测到：
+
+```
+vllm:gpu_prefix_cache_queries_total = 0
+vllm:gpu_prefix_cache_hits_total = 0
+```
+
+因此该组没有发生 GPU Prefix Cache 复用。
+
+### 9.2 单并发对照结果
+
+| 指标 | Prefix Cache 开启 | Prefix Cache 关闭 | 开启缓存变化 |
+| --- |  --- |  --- |  --- |
+| RPS | 3.14 | 3.01 | +4.3% |
+| --- |  --- |  --- |  --- |
+| 生成吞吐量 | 150.72 tokens/s | 144.24 tokens/s | +4.5% |
+| TTFT 平均 | 19.22 ms | 60.57 ms | 降低 68.3% |
+| TTFT P95 | 24.53 ms | 77.65 ms | 降低 68.4% |
+| TPOT P95 | 6.66 ms | 6.45 ms | 基本持平 |
+| E2E 平均 | 318.41 ms | 332.72 ms | 降低 4.3% |
+| E2E P95 | 336.89 ms | 365.79 ms | 降低 7.9% |
+| 错误率 | 0.00% | 0.00% | 无变化 |
+
+### 9.3 结论
+
+Prefix Cache 的收益集中在共享前缀的 prefill 阶段。对于本实验的长共享 prompt，开启缓存后 TTFT P95 从 77.65 ms 降至 24.53 ms，降低约 68.4%。
+
+TPOT 没有显著改善，符合机制预期：Prefix Cache 复用的是已有 prompt 的 KV states，不会减少后续自回归 decode 时每个新 token 的前向计算。
+
+E2E P95 只降低约 7.9%，说明该请求的总时延主要由生成阶段构成。生产环境不能把 TTFT 的 68.4% 改善误解为整体请求时延同等比例改善。
+
+该实验验证了 Prefix Cache 适合具有高共享系统提示词、长文档模板、RAG 公共上下文或多轮会话公共历史的业务；对于 prompt 高度离散的流量，缓存收益会明显下降。
+
