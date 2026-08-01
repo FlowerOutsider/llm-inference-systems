@@ -1,0 +1,48 @@
+groups:
+  - name: vllm-serving-alert-rules
+    interval: 5s
+    rules:
+      - alert: VLLMScrapeTargetDown
+        expr: up{job="vllm"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "vLLM metrics target is down"
+          description: "Prometheus cannot scrape the vLLM metrics endpoint for over one minute."
+
+      - alert: VLLMHighTTFTP95
+        expr: vllm:ttft_p95_seconds:5m > 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM TTFT P95 exceeds 150 ms"
+          description: "TTFT P95 has remained above 150 ms for five minutes."
+
+      - alert: VLLMQueueBacklog
+        expr: max_over_time(vllm:requests_waiting[1m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM request queue remains non-empty"
+          description: "At least one request has remained waiting for two minutes."
+
+      - alert: VLLMHighGPUKVCacheUsage
+        expr: vllm:gpu_cache_usage_ratio > 0.90
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM GPU KV Cache usage exceeds 90%"
+          description: "High KV Cache pressure can lead to preemption or rejected requests."
+
+      - alert: VLLMPreemptionsDetected
+        expr: increase(vllm:num_preemptions_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM request preemption detected"
+          description: "At least one request was preempted during the last five minutes."

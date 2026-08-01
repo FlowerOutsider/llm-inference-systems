@@ -1,0 +1,68 @@
+groups:
+  - name: vllm-serving-recording-rules
+    interval: 5s
+    rules:
+      - record: vllm:completed_requests_per_second:5m
+        expr: |
+          sum by (model_name) (
+            rate(
+              vllm:request_success_total{
+                finished_reason=~"stop|length"
+              }[5m]
+            )
+          )
+
+      - record: vllm:prompt_tokens_per_second:5m
+        expr: |
+          sum by (model_name) (rate(vllm:prompt_tokens_total[5m]))
+
+      - record: vllm:generation_tokens_per_second:5m
+        expr: |
+          sum by (model_name) (rate(vllm:generation_tokens_total[5m]))
+
+      - record: vllm:ttft_p95_seconds:5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (model_name, le) (
+              rate(vllm:time_to_first_token_seconds_bucket[5m])
+            )
+          )
+
+      - record: vllm:tpot_p95_seconds:5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (model_name, le) (
+              rate(vllm:time_per_output_token_seconds_bucket[5m])
+            )
+          )
+
+      - record: vllm:prefix_cache_hit_ratio:5m
+        expr: |
+          sum by (model_name) (
+            rate(vllm:gpu_prefix_cache_hits_total[5m])
+          )
+          /
+          clamp_min(
+            sum by (model_name) (
+              rate(vllm:gpu_prefix_cache_queries_total[5m])
+            ),
+            1
+          )
+
+      - record: vllm:gpu_cache_usage_ratio
+        expr: |
+          max by (model_name) (vllm:gpu_cache_usage_perc)
+
+      - record: vllm:requests_waiting
+        expr: |
+          max by (model_name) (vllm:num_requests_waiting)
+
+      - record: vllm:requests_running
+        expr: |
+          max by (model_name) (vllm:num_requests_running)
+
+      - record: vllm:preemptions_per_second:5m
+        expr: |
+          sum by (model_name) (rate(vllm:num_preemptions_total[5m]))

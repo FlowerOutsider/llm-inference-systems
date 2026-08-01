@@ -57,7 +57,68 @@ services:
       timeout: 5s
       retries: 20
       start_period: 120s
-      
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.0.1}
+    restart: unless-stopped
+
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+
+    volumes:
+      - type: bind
+        source: ./prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+      - type: bind
+        source: ./prometheus/rules
+        target: /etc/prometheus/rules
+        read_only: true
+      - type: volume
+        source: prometheus_data
+        target: /prometheus
+
+    depends_on:
+      vllm:
+        condition: service_healthy
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.4.0}
+    restart: unless-stopped
+
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in infra/docker/vllm/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+
+    volumes:
+      - type: bind
+        source: ./grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+      - type: volume
+        source: grafana_data
+        target: /var/lib/grafana
+      - type: bind
+        source: ./grafana/dashboards
+        target: /var/lib/grafana/dashboards
+        read_only: true
+
+    depends_on:
+      prometheus:
+        condition: service_started
+
+
 volumes:
   vllm_compile_cache:
-    name: llm-inference-vllm-compile-cache
+  prometheus_data:
+  grafana_data:
