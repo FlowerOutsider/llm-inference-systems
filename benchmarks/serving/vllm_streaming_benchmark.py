@@ -324,7 +324,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure TTFT, TPOT, and throughput against a vLLM server."
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:8002")
+    parser.add_argument(
+        "--base-url",
+        required=True,
+        help="Base URL of the target OpenAI-compatible inference service.",
+    )
     parser.add_argument("--model", default="qwen2.5-0.5b")
     parser.add_argument("--warmup-requests", type=int, default=2)
     parser.add_argument("--requests", type=int, default=8)
