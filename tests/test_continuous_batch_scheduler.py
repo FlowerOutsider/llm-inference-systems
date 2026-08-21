@@ -7,6 +7,7 @@ from serving.control_plane.request_state import (
     RequestPhase,
 )
 
+import pytest
 
 def make_request(
     request_id: str,
@@ -161,3 +162,41 @@ def test_decode_completion_respects_max_new_tokens() -> None:
     assert request.phase is RequestPhase.FINISHED
     assert request.generated_token_ids == [101, 102]
     assert scheduler.schedule().decode == ()
+
+def test_failed_request_is_never_scheduled_and_keeps_failure_reason() -> None:
+    scheduler = ContinuousBatchScheduler(
+        SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=4,
+        )
+    )
+    request = make_request("backend-failure", prompt_length=2)
+    scheduler.submit(request)
+
+    scheduler.fail("backend-failure", reason="vLLM worker timeout")
+
+    assert request.phase is RequestPhase.FAILED
+    assert request.failure_reason == "vLLM worker timeout"
+    assert scheduler.schedule().total_scheduled_tokens == 0
+
+
+def test_remove_requires_terminal_request() -> None:
+    scheduler = ContinuousBatchScheduler(
+        SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=4,
+        )
+    )
+    request = make_request("remove-me", prompt_length=1)
+    scheduler.submit(request)
+
+    with pytest.raises(ValueError, match="non-terminal"):
+        scheduler.remove("remove-me")
+
+    scheduler.cancel("remove-me")
+    scheduler.remove("remove-me")
+
+    with pytest.raises(KeyError, match="remove-me"):
+        scheduler.get_request("remove-me")

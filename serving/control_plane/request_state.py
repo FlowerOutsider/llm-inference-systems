@@ -11,6 +11,7 @@ class RequestPhase(str, Enum):
     DECODE = "decode"
     FINISHED = "finished"
     CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class RequestStateError(RuntimeError):
@@ -25,6 +26,8 @@ class InferenceRequest:
     phase: RequestPhase = RequestPhase.WAITING
     prefill_offset: int = 0
     generated_token_ids: list[int] = field(default_factory=list)
+    failure_reason: str | None = None
+
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -52,6 +55,7 @@ class InferenceRequest:
         return self.phase in {
             RequestPhase.FINISHED,
             RequestPhase.CANCELLED,
+            RequestPhase.FAILED,
         }
 
     def advance_prefill(self, token_count: int) -> None:
@@ -90,3 +94,14 @@ class InferenceRequest:
             return
 
         self.phase = RequestPhase.CANCELLED
+
+    def fail(self, reason: str) -> None:
+        if self.is_terminal:
+            return
+
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("failure reason must not be empty")
+
+        self.failure_reason = normalized_reason
+        self.phase = RequestPhase.FAILED

@@ -70,6 +70,18 @@ class ContinuousBatchScheduler:
     def cancel(self, request_id: str) -> None:
         self._get_request(request_id).cancel()
 
+    def fail(self, request_id: str, *, reason: str) -> None:
+        self._get_request(request_id).fail(reason)
+
+    def remove(self, request_id: str) -> None:
+        request = self._get_request(request_id)
+        if not request.is_terminal:
+            raise ValueError(
+                f"cannot remove non-terminal request: {request_id}"
+            )
+
+        del self._requests[request_id]
+
     def schedule(self) -> SchedulePlan:
         remaining_token_budget = self._config.max_num_batched_tokens
         remaining_sequence_budget = self._config.max_num_seqs

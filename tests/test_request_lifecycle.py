@@ -237,3 +237,30 @@ def test_slot_exhaustion_rejects_request_without_submitting_to_scheduler() -> No
         )
 
     assert scheduler.active_request_ids() == ("first",)
+
+
+def test_fail_releases_slot_and_removes_request_from_scheduler() -> None:
+    cache = make_cache()
+    scheduler = make_scheduler()
+    manager = RequestLifecycleManager(
+        cache=cache,
+        scheduler=scheduler,
+    )
+    request = InferenceRequest(
+        request_id="worker-failure",
+        prompt_token_ids=(1, 2, 3),
+        max_new_tokens=2,
+    )
+
+    slot_id = manager.submit(request).slot_id
+    manager.fail("worker-failure", reason="vLLM worker timeout")
+
+    assert request.phase is RequestPhase.FAILED
+    assert request.failure_reason == "vLLM worker timeout"
+    assert manager.active_request_ids() == ()
+
+    with pytest.raises(KeyError, match="worker-failure"):
+        scheduler.get_request("worker-failure")
+
+    with pytest.raises(KVCacheError, match="not allocated"):
+        cache.length(slot_id)

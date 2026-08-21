@@ -105,6 +105,7 @@ class RequestLifecycleManager:
         except Exception:
             if submitted_to_scheduler:
                 self._scheduler.cancel(request.request_id)
+                self._scheduler.remove(request.request_id)
 
             self._cache.release([slot_id])
             raise
@@ -113,7 +114,16 @@ class RequestLifecycleManager:
         self._require_active_slot(request_id)
 
         self._scheduler.cancel(request_id)
+        self._scheduler.remove(request_id)
         self._release_slot(request_id)
+
+    def fail(self, request_id: str, *, reason: str) -> None:
+        self._require_active_slot(request_id)
+
+        self._scheduler.fail(request_id, reason=reason)
+        self._scheduler.remove(request_id)
+        self._release_slot(request_id)
+
 
     def finalize(self, request_id: str) -> None:
         self._require_active_slot(request_id)
@@ -124,7 +134,7 @@ class RequestLifecycleManager:
                 f"cannot finalize request {request_id} while it is "
                 f"{request.phase.value}"
             )
-
+        self._scheduler.remove(request_id)
         self._release_slot(request_id)
 
     def slot_for(self, request_id: str) -> int:
@@ -134,8 +144,9 @@ class RequestLifecycleManager:
         return tuple(self._active_slots)
 
     def _release_slot(self, request_id: str) -> None:
-        slot_id = self._active_slots.pop(request_id)
+        slot_id = self._active_slots[request_id]
         self._cache.release([slot_id])
+        del self._active_slots[request_id]
 
     def _require_active_slot(self, request_id: str) -> int:
         try:
