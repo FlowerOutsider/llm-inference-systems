@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -10,7 +10,6 @@ from serving.control_plane.load_aware_router import (
     RoutingRequest,
 )
 from serving.control_plane.vllm_metrics_collector import (
-    VLLMMetricsCollector,
     WorkerRegistration,
 )
 from serving.control_plane.worker_registry import (
@@ -109,7 +108,7 @@ class GatewayService:
         self._registrations = registrations
         self._worker_resolver = worker_resolver
 
-    async def stream_chat_completion(
+    async def prepare_stream_chat_completion(
         self,
         request: GatewayChatRequest,
     ) -> AsyncIterator[StreamingChatCompletionEvent]:
@@ -117,27 +116,37 @@ class GatewayService:
 
         try:
             decision = self._router.route(
-                RoutingRequest(
-                    request_id=request.request_id,
-                    model_id=request.model_id,
-                    prefix_candidate_worker_ids=(
-                        request.prefix_candidate_worker_ids
-                    ),
-                )
+            RoutingRequest(
+                request_id=request.request_id,
+                model_id=request.model_id,
+                prefix_candidate_worker_ids=(
+                    request.prefix_candidate_worker_ids
+                ),
+            )
             )
         except NoHealthyWorkerError as exc:
             raise GatewayNoAvailableWorkerError(str(exc)) from exc
 
-        selected_worker = self._registry.get(decision.worker_id)
-        worker = self._worker_resolver(
-            selected_worker,
-            request.model_id,
-        )
+        snapshot = self._registry.get(decision.worker_id)
+        if snapshot is None:
+            raise GatewayNoAvailableWorkerError(
+                f"selected worker disappeared: {decision.worker_id}"
+            )
 
-        async for event in worker.stream_chat_completion(
+        worker = self._worker_resolver(snapshot, request.model_id)
+
+        return worker.stream_chat_completion(
             messages=list(request.messages),
             max_tokens=request.max_tokens,
-        ):
+        )
+
+    async def stream_chat_completion(
+        self,
+        request: GatewayChatRequest,
+    ) -> AsyncIterator[StreamingChatCompletionEvent]:
+        stream = await self.prepare_stream_chat_completion(request)
+
+        async for event in stream:
             yield event
 
     async def _refresh_worker_snapshots(self) -> None:
